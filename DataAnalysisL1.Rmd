@@ -1,0 +1,2525 @@
+---
+title: "Clustering Daily Solar Irradiance Patterns — L1 Analysis"
+author: "Wehan Smith"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+# About this analysis
+
+This notebook contains the L1 (Kalkbult Solar Park) analysis for the Honours
+project. Supply the original CAMS file as `L1.csv` in the notebook directory.
+The same methodology was applied separately at L2–L5 using their respective data.
+
+This version was rebuilt directly from the original working file. Retained
+analysis statements preserve their original text and order. Experimental
+engineered-GHI calculations, preliminary bootstrap trials, redundant inspection
+output and file exports have been removed. Final figures and tables are displayed
+in HTML. The bootstrap functions retain their original defaults, but the final
+assessment explicitly requests 1,000 repetitions.
+
+
+## Packages and data preparation
+
+```{r analysis-000, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(GGally)
+library(clusterCrit)
+
+
+# Versions used
+R.version.string
+
+sapply(
+  c("dtwclust", "proxy", "cluster", "clusterCrit", "mclust"),
+  function(pkg) as.character(packageVersion(pkg))
+)
+```
+
+```{r analysis-001}
+cams <- read_delim(
+  "L1.csv",
+  delim = ";",
+  skip = 42
+)
+
+```
+
+```{r analysis-002}
+cams <- cams %>%
+  separate(
+    `# Observation period`,
+    into = c("Start", "End"),
+    sep = "/"
+  ) %>%
+  mutate(
+    Start = ymd_hms(Start),
+    End   = ymd_hms(End),
+    Date  = as.Date(Start),
+    Hour  = hour(Start),
+    Month = month(Start, label = TRUE)
+  )
+
+```
+
+```{r analysis-005}
+colSums(is.na(cams))
+cams %>%
+  filter(is.na(GHI) | is.na(BHI) | is.na(DHI) | is.na(BNI)) %>%
+  count(Date)
+cams %>%
+  filter(is.na(GHI) | is.na(BHI) | is.na(DHI) | is.na(BNI)) %>%
+  select(Date, Hour, Start, GHI, BHI, DHI, BNI, Reliability)
+cams %>%
+  summarise(
+    missing_GHI = sum(is.na(GHI)),
+    missing_BHI = sum(is.na(BHI)),
+    missing_DHI = sum(is.na(DHI)),
+    missing_BNI = sum(is.na(BNI)),
+    rows_with_any_missing = sum(
+      is.na(GHI) | is.na(BHI) | is.na(DHI) | is.na(BNI)
+    )
+  )
+```
+
+```{r analysis-006}
+# Remove dates containing missing irradiance observations
+dates_with_missing <- cams %>%
+  filter(is.na(GHI) | is.na(BHI) | is.na(DHI) | is.na(BNI) | is.na(`Clear sky GHI`)) %>%
+  distinct(Date)
+
+cams_processed <- cams %>%
+  filter(!Date %in% dates_with_missing$Date)
+
+# Check the processed dataset
+colSums(is.na(cams_processed))
+
+## Check whether the fixed profile window removes any irradiance
+
+cams_processed %>%
+  filter(Hour < 4 | Hour > 19) %>%
+  summarise(
+    Positive_GHI_Outside = sum(GHI > 0, na.rm = TRUE),
+    Positive_CS_GHI_Outside = sum(`Clear sky GHI` > 0, na.rm = TRUE),
+    Total_GHI_Outside = sum(GHI, na.rm = TRUE),
+    Total_CS_GHI_Outside = sum(`Clear sky GHI`, na.rm = TRUE)
+  )
+```
+
+```{r analysis-007}
+sum(duplicated(cams_processed))
+```
+
+
+## Exploratory analysis
+
+```{r analysis-008}
+## Positive Irradiance Distributions (i.e. excluding the 0 irradiance values)
+cams_processed %>%
+  filter(Hour >= 4, Hour <= 19) %>%
+  select(
+    GHI, BHI, DHI, BNI,
+    `Clear sky GHI`,
+    `Clear sky BHI`,
+    `Clear sky DHI`,
+    `Clear sky BNI`
+  ) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(
+    bins = 40,
+    fill = "steelblue",
+    colour = "white"
+  ) +
+  facet_wrap(~name, scales = "free") +
+  theme_minimal()
+```
+
+```{r analysis-010}
+## Define the fixed daily irradiance analysis window
+## One-hour buffer around the observed meaningful irradiance period
+
+analysis_start <- 4
+analysis_end   <- 19
+
+# Validate this fixed window separately at every location.
+# These checks do not remove observations or alter clustering inputs.
+outside_window <- cams_processed %>%
+  filter(Hour < analysis_start | Hour > analysis_end)
+
+if (any(outside_window$GHI > 0 | outside_window$`Clear sky GHI` > 0)) {
+  stop("Positive irradiation occurs outside the profile window. Review the window and all matching profile columns for this location.")
+}
+
+cams_processed <- cams_processed %>%
+  filter(Hour >= analysis_start & Hour <= analysis_end)
+
+profile_record_check <- cams_processed %>%
+  group_by(Date) %>%
+  summarise(
+    Records = n(),
+    Unique_Hours = n_distinct(Hour),
+    .groups = "drop"
+  )
+
+if (any(profile_record_check$Records != analysis_end - analysis_start + 1 |
+        profile_record_check$Unique_Hours != analysis_end - analysis_start + 1)) {
+  stop("Retained days must have exactly one observation for each profile hour.")
+}
+```
+
+```{r analysis-011}
+## Boxplots for Irradiance Outlier Detection
+
+cams_processed %>%
+  select(GHI, BHI, DHI, BNI, `Clear sky GHI`,
+    `Clear sky BHI`,
+    `Clear sky DHI`,
+    `Clear sky BNI`) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0) %>%
+  ggplot(aes(x = "", y = value)) +
+  geom_boxplot(fill = "orange") +
+  facet_wrap(~name, scales = "free") +
+  theme_minimal() +
+  xlab("")
+
+## IQR-based outlier limits
+
+cams_processed %>%
+  select(GHI, BHI, DHI, BNI) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0) %>%
+  group_by(name) %>%
+  summarise(
+    Q1 = quantile(value, 0.25),
+    Q3 = quantile(value, 0.75),
+    IQR = IQR(value),
+    Lower = Q1 - 1.5 * IQR,
+    Upper = Q3 + 1.5 * IQR
+  )
+```
+
+```{r analysis-012}
+## Identify potential irradiance outliers
+
+outlier_limits <- cams_processed %>%
+  select(GHI, BHI, DHI, BNI) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0) %>%
+  group_by(name) %>%
+  summarise(
+    Q1 = quantile(value, 0.25),
+    Q3 = quantile(value, 0.75),
+    IQR = IQR(value),
+    Upper = Q3 + 1.5 * IQR
+  )
+
+```
+
+```{r analysis-013}
+## Number of IQR-based outliers by irradiance variable
+
+cams_processed %>%
+  select(GHI, BHI, DHI, BNI) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0) %>%
+  left_join(outlier_limits, by = c("name" = "name")) %>%
+  filter(value > Upper) %>%
+  count(name)
+
+
+## Percentage of positive observations classified as IQR outliers
+
+cams_processed %>%
+  select(GHI, BHI, DHI, BNI) %>%
+  pivot_longer(everything()) %>%
+  filter(value > 0) %>%
+  left_join(outlier_limits, by = c("name" = "name")) %>%
+  group_by(name) %>%
+  summarise(
+    total_positive = n(),
+    potential_outliers = sum(value > Upper),
+    percentage = 100 * potential_outliers / total_positive
+  )
+
+## Potential DHI outliers by hour
+
+dhi_upper <- outlier_limits %>%
+  filter(name == "DHI") %>%
+  pull(Upper)
+
+cams_processed %>%
+  filter(DHI > dhi_upper) %>%
+  count(Hour) %>%
+  arrange(Hour)
+```
+
+```{r analysis-014}
+## Correlation Matrix
+
+numeric_data <- cams_processed %>%
+  filter(Hour >= 4, Hour <= 19, GHI > 0) %>%
+  select(
+    GHI,
+    BHI,
+    DHI,
+    BNI,
+    `Clear sky GHI`,
+    `Clear sky BHI`,
+    `Clear sky DHI`,
+    `Clear sky BNI`,
+    Reliability
+  ) %>%
+  rename(
+    `CS GHI` = `Clear sky GHI`,
+    `CS BHI` = `Clear sky BHI`,
+    `CS DHI` = `Clear sky DHI`,
+    `CS BNI` = `Clear sky BNI`
+  )
+
+cor_matrix <- cor(
+  numeric_data,
+  use = "complete.obs"
+)
+
+round(cor_matrix, 2)
+```
+
+```{r analysis-015, fig.width=8, fig.height=6}
+GGally::ggcorr(
+  numeric_data,
+  label = TRUE,
+  label_round = 2,
+)
+```
+
+```{r analysis-018}
+## Monthly Distribution of GHI
+
+cams_processed %>%
+  filter(Hour >= 4, Hour <= 19, GHI > 0) %>%
+  ggplot(aes(x = Month, y = GHI)) +
+  geom_boxplot() +
+  labs(
+    title = "Monthly Distribution of Global Horizontal Irradiance During Daylight Hours",
+    x = "Month",
+    y = "GHI (Wh/m²)"
+  ) +
+  theme_minimal()
+```
+
+```{r analysis-019}
+## Average Hourly Irradiance
+
+cams_processed %>%
+  filter(Hour >= 4, Hour <= 19) %>%
+  group_by(Hour) %>%
+  summarise(
+    Mean_GHI = mean(GHI, na.rm = TRUE),
+    Mean_C_GHI = mean(`Clear sky GHI`, na.rm = TRUE)
+  ) %>%
+  ggplot(aes(x = Hour)) +
+  geom_line(aes(y = Mean_GHI, colour = "Measured GHI")) +
+  geom_line(aes(y = Mean_C_GHI, colour = "Clear-Sky GHI")) +
+  scale_x_continuous(
+    breaks = seq(4, 19, by = 2)
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 1000, by = 100)
+  ) +
+  labs(
+    title = "Average Hourly Measured and Clear-Sky GHI",
+    x = "Hour",
+    y = "Mean GHI (Wh/m²)",
+    colour = "Irradiance"
+  ) +
+  theme_minimal()
+```
+
+
+## Daily profiles and clear-sky features
+
+```{r analysis-022}
+cams_processed <- cams_processed %>%
+  mutate(
+    CSI = if_else(
+      `Clear sky GHI` > 0,
+      GHI / `Clear sky GHI`,
+      NA_real_
+    )
+  )
+
+```
+
+```{r analysis-026}
+## Constructing Daily GHI Profiles
+
+daily_profiles <- cams_processed %>%
+  select(Date, Hour, GHI) %>%
+  pivot_wider(
+    names_from = Hour,
+    values_from = GHI,
+    names_prefix = "GHI_"
+  ) %>%
+  arrange(Date) %>%
+  select(
+    Date,
+    all_of(paste0("GHI_", 4:19))
+  )
+
+
+## Check number of hourly observations per day
+
+cams_processed %>%
+  count(Date) %>%
+  count(n)
+
+## Check for missing values in daily profiles
+
+daily_profiles %>%
+  summarise(
+    missing_values = sum(is.na(across(-Date)))
+  )
+
+## Check dimensions
+
+```
+
+```{r analysis-029}
+## Sunshine duration
+
+sunshine_duration <- cams_processed %>%
+  group_by(Date) %>%
+  summarise(
+    Sunshine_Duration = sum(`Clear sky GHI` > 0) * 60,
+    .groups = "drop"
+  )
+
+summary(sunshine_duration$Sunshine_Duration)
+range(sunshine_duration$Sunshine_Duration)
+
+#monthly behaviour:
+sunshine_duration %>%
+  mutate(Month = format(Date, "%m")) %>%
+  group_by(Month) %>%
+  summarise(
+    Mean_Sunshine = mean(Sunshine_Duration),
+    .groups = "drop"
+  )
+```
+
+```{r analysis-030}
+# Diagnostic only: existing data and clustering inputs remain unchanged.
+diagnostic_location <- "L1"
+
+# Matching winter and summer dates for every location.
+diagnostic_dates <- as.Date(c(
+  "2020-06-20", "2020-06-21", "2020-06-22",
+  "2020-12-20", "2020-12-21", "2020-12-22"
+))
+
+cat("\nDAYLIGHT-PROXY DIAGNOSTIC:", diagnostic_location, "\n")
+
+# 1. Distribution of the actual proxy across all retained days.
+cat("\n1. Proxy values across all retained days\n")
+
+diagnostic_distribution <- sunshine_duration %>%
+  count(Sunshine_Duration, name = "Days") %>%
+  arrange(Sunshine_Duration)
+
+print(diagnostic_distribution, n = Inf)
+
+# 2. Use the original hourly data to retain observations outside
+#    the 04:00–20:00 window as well.
+diagnostic_hourly <- cams %>%
+  filter(Date %in% diagnostic_dates) %>%
+  arrange(Date, Start) %>%
+  mutate(
+    In_Window = Hour >= analysis_start & Hour <= analysis_end,
+    Positive_CS = `Clear sky GHI` > 0
+  )
+
+# Check that the selected dates have complete hourly records.
+diagnostic_records <- diagnostic_hourly %>%
+  group_by(Date) %>%
+  summarise(
+    Records = n(),
+    Unique_Hours = n_distinct(Hour),
+    Missing_CS = sum(is.na(`Clear sky GHI`)),
+    .groups = "drop"
+  )
+
+if (nrow(diagnostic_records) != length(diagnostic_dates) ||
+    any(diagnostic_records$Records != 24 |
+        diagnostic_records$Unique_Hours != 24 |
+        diagnostic_records$Missing_CS > 0)) {
+  print(diagnostic_records)
+  stop("Selected dates are missing or incomplete. Check before interpreting.")
+}
+
+# 3. Recalculate counts and compare them with the fitted feature.
+diagnostic_counts <- diagnostic_hourly %>%
+  group_by(Date) %>%
+  summarise(
+    Positive_Hours_All_Day = sum(Positive_CS),
+    Positive_Hours_In_Window = sum(Positive_CS & In_Window),
+    Positive_Hours_Outside = sum(Positive_CS & !In_Window),
+    Recalculated_Proxy_Min = 60 * Positive_Hours_In_Window,
+    .groups = "drop"
+  ) %>%
+  left_join(sunshine_duration, by = "Date") %>%
+  mutate(
+    Matches_Existing = Recalculated_Proxy_Min == Sunshine_Duration
+  )
+
+cat("\n2. Counts and comparison with the existing proxy\n")
+print(diagnostic_counts, n = Inf, width = Inf)
+
+if (any(is.na(diagnostic_counts$Sunshine_Duration)) ||
+    any(!diagnostic_counts$Matches_Existing, na.rm = TRUE)) {
+  warning("Some selected dates are absent from the retained data or counts differ.")
+}
+
+# 4. Display hourly values around the morning and evening boundaries.
+#    Full 24-hour data remain available in diagnostic_hourly.
+diagnostic_boundaries <- diagnostic_hourly %>%
+  filter(Hour <= 9 | Hour >= 15) %>%
+  transmute(
+    Date,
+    Interval_Start = format(Start, "%Y-%m-%d %H:%M:%S"),
+    Interval_End = format(End, "%Y-%m-%d %H:%M:%S"),
+    CS_GHI_Wh_m2 = sprintf("%.12g", `Clear sky GHI`),
+    In_Window,
+    Counted_In_Proxy = Positive_CS & In_Window
+  )
+
+cat("\n3. Morning and evening values; timestamps as stored in the Rmd\n")
+print(diagnostic_boundaries, n = Inf, width = Inf)
+
+# 4. Diagnostic sensitivity to small positive values.
+#    These are illustrative thresholds, NOT proposed replacements
+#    for the > 0 rule used in the study.
+diagnostic_thresholds <- c(0, 0.001, 0.01, 0.1, 1)
+
+diagnostic_sensitivity <- bind_rows(lapply(
+  diagnostic_thresholds,
+  function(threshold) {
+    diagnostic_hourly %>%
+      filter(In_Window) %>%
+      group_by(Date) %>%
+      summarise(
+        Threshold_Wh_m2 = threshold,
+        Counted_Hours = sum(`Clear sky GHI` > threshold),
+        Proxy_Minutes = 60 * Counted_Hours,
+        .groups = "drop"
+      )
+  }
+)) %>%
+  arrange(Date, Threshold_Wh_m2)
+
+cat("\n4. Sensitivity of the count to small positive values\n")
+print(diagnostic_sensitivity, n = Inf, width = Inf)
+```
+
+```{r analysis-031}
+## Daily clear-sky irradiation
+
+daily_cs_area <- cams_processed %>%
+  group_by(Date) %>%
+  summarise(
+    CS_Area = sum(`Clear sky GHI`, na.rm = TRUE) / 1000,
+    .groups = "drop"
+  )
+
+
+summary(daily_cs_area$CS_Area)
+
+range(daily_cs_area$CS_Area)
+
+daily_cs_area %>%
+  mutate(Month = format(Date, "%m")) %>%
+  group_by(Month) %>%
+  summarise(
+    Mean_CS_Area = mean(CS_Area),
+    .groups = "drop"
+  )
+
+## Combine the two Level 1 features
+
+level1_features <- sunshine_duration %>%
+  inner_join(
+    daily_cs_area,
+    by = "Date"
+  ) %>%
+  arrange(Date)
+
+## Checks
+
+summary(level1_features)
+```
+
+
+## Level 1 clustering
+
+```{r analysis-032}
+## Level 1 K-Means clustering
+
+set.seed(2026)
+
+level1_kmeans <- kmeans(
+  level1_features %>%
+    select(Sunshine_Duration, CS_Area),
+  centers = 3,
+  nstart = 25
+)
+
+level1_kmeans
+
+#attach clusters to dates
+level1_results <- level1_features %>%
+  mutate(
+    Cluster = level1_kmeans$cluster
+  )
+
+
+#cluster centres
+level1_kmeans$centers
+
+#inspecting the dates
+level1_results %>%
+  mutate(Month = format(Date, "%m")) %>%
+  count(Cluster, Month)
+```
+
+```{r analysis-033}
+## Standardise Level 1 features
+
+level1_scaled <- level1_features %>%
+  select(Sunshine_Duration, CS_Area) %>%
+  scale()
+
+```
+
+```{r analysis-037}
+## Level 1 K-Means using scaled features
+
+set.seed(2026)
+
+level1_kmeans_scaled <- kmeans(
+  level1_scaled,
+  centers = 3,
+  nstart = 25
+)
+
+## View scaled cluster centres
+level1_kmeans_scaled$centers
+
+
+## Attach cluster assignments to dates
+
+level1_results_scaled <- level1_features %>%
+  mutate(
+    Cluster = level1_kmeans_scaled$cluster
+  )
+
+## Cluster sizes
+
+table(level1_results_scaled$Cluster)
+
+
+## Identify clusters based on their mean Sunshine Duration and CS Area
+## Lowest = Winter, middle = Transition, highest = Summer
+
+season_score <- rowMeans(
+  level1_kmeans_scaled$centers[
+    , c("Sunshine_Duration", "CS_Area"),
+    drop = FALSE
+  ]
+)
+
+cluster_order <- order(season_score)
+
+winter_cluster <- cluster_order[1]
+transition_cluster <- cluster_order[2]
+summer_cluster <- cluster_order[3]
+
+
+## Assign seasonal labels
+
+level1_results_scaled <- level1_results_scaled %>%
+  mutate(
+    Season = case_when(
+      Cluster == summer_cluster ~ "Summer",
+      Cluster == transition_cluster ~ "Transition",
+      Cluster == winter_cluster ~ "Winter"
+    ),
+    Year = format(Date, "%Y"),
+    Day_of_Year = as.integer(format(Date, "%j"))
+  )
+
+
+## Cluster sizes by season
+
+table(level1_results_scaled$Season)
+
+
+## Seasonal assignments over time
+
+ggplot(
+  level1_results_scaled,
+  aes(
+    x = Day_of_Year,
+    y = Year,
+    fill = Season
+  )
+) +
+  geom_tile() +
+  labs(
+    title = "Level 1 Seasonal Assignments by Year (Scaled Features)",
+    x = "Day of Year",
+    y = "Year",
+    fill = "Season"
+  ) +
+  theme_minimal()
+
+
+## Level 1 clustering quality metrics
+
+level1_metrics_scaled <- intCriteria(
+  as.matrix(level1_scaled),
+  level1_kmeans_scaled$cluster,
+  c(
+    "Silhouette",
+    "Calinski_Harabasz",
+    "Davies_Bouldin"
+  )
+)
+
+## Display metrics
+
+data.frame(
+  Silhouette = level1_metrics_scaled$silhouette,
+  Calinski_Harabasz = level1_metrics_scaled$calinski_harabasz,
+  Davies_Bouldin = level1_metrics_scaled$davies_bouldin
+)
+```
+
+
+## Daily β and Level 2 clustering
+
+```{r analysis-039}
+## Daily Irradiance Index (Beta)
+
+daily_beta <- cams_processed %>%
+  filter(Hour >= 4, Hour <= 19) %>%
+  group_by(Date) %>%
+  summarise(
+    daily_GHI = sum(GHI, na.rm = TRUE),
+    daily_clear_sky_GHI = sum(`Clear sky GHI`, na.rm = TRUE),
+    beta = daily_GHI / daily_clear_sky_GHI,
+    .groups = "drop"
+  )
+
+## Summary of Beta
+
+summary(daily_beta$beta)
+
+## Distribution of Beta
+
+ggplot(daily_beta, aes(x = beta)) +
+  geom_histogram(bins = 40) +
+  labs(
+    title = "Distribution of Daily Irradiance Index (β)",
+    x = "β",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r analysis-040}
+## Check β values
+
+daily_beta %>%
+  summarise(
+    Beta_missing = sum(is.na(beta)),
+    Beta_below_0 = sum(beta < 0, na.rm = TRUE),
+    Beta_above_1 = sum(beta > 1, na.rm = TRUE),
+    Beta_min = min(beta, na.rm = TRUE),
+    Beta_median = median(beta, na.rm = TRUE),
+    Beta_mean = mean(beta, na.rm = TRUE),
+    Beta_max = max(beta, na.rm = TRUE)
+  )
+## Check β values above 1
+
+daily_beta %>%
+  filter(beta > 1) %>%
+  summarise(
+    n_above_1 = n(),
+    max_excess = max(beta - 1),
+    mean_excess = mean(beta - 1)
+  )
+```
+
+```{r analysis-041}
+## Attach Level 1 season results
+
+level2_data <- level1_results_scaled %>%
+  select(Date, Season) %>%
+  inner_join(
+    daily_beta %>%
+      select(Date, beta),
+    by = "Date"
+  )
+
+```
+
+```{r analysis-044}
+## Level 2 K-Means clustering
+
+set.seed(2026)
+
+## Summer
+summer_kmeans <- kmeans(
+  level2_data %>%
+    filter(Season == "Summer") %>%
+    select(beta),
+  centers = 3,
+  nstart = 25
+)
+
+
+## Transition
+transition_kmeans <- kmeans(
+  level2_data %>%
+    filter(Season == "Transition") %>%
+    select(beta),
+  centers = 3,
+  nstart = 25
+)
+
+
+## Winter
+winter_kmeans <- kmeans(
+  level2_data %>%
+    filter(Season == "Winter") %>%
+    select(beta),
+  centers = 3,
+  nstart = 25
+)
+
+summer_kmeans$centers
+transition_kmeans$centers
+winter_kmeans$centers
+```
+
+```{r analysis-045}
+## Assign High / Medium / Low labels
+## Function to assign H/M/L labels to a seasonal K-Means result
+
+label_kmeans <- function(kmeans_result) {
+  cluster_order <- order(kmeans_result$centers[, "beta"])
+  labels <- c("Low", "Medium", "High")
+  setNames(
+    labels,
+    cluster_order
+  )
+}
+
+summer_labels <- label_kmeans(summer_kmeans)
+transition_labels <- label_kmeans(transition_kmeans)
+winter_labels <- label_kmeans(winter_kmeans)
+summer_labels
+transition_labels
+winter_labels
+```
+
+```{r analysis-046}
+# Adding the labels to the data
+
+level2_results <- level2_data %>%
+  mutate(
+    Cluster = case_when(
+      Season == "Summer" ~ summer_kmeans$cluster[
+        match(Date, level2_data$Date[level2_data$Season == "Summer"])
+      ],
+      
+      Season == "Transition" ~ transition_kmeans$cluster[
+        match(Date, level2_data$Date[level2_data$Season == "Transition"])
+      ],
+      
+      Season == "Winter" ~ winter_kmeans$cluster[
+        match(Date, level2_data$Date[level2_data$Season == "Winter"])
+      ]
+    )
+  )
+
+# Converting cluster numbers into meaningful irradiance levels
+
+level2_results <- level2_results %>%
+  mutate(
+    Irradiance_Level = case_when(
+      Season == "Summer" ~ unname(
+        summer_labels[as.character(Cluster)]
+      ),
+      
+      Season == "Transition" ~ unname(
+        transition_labels[as.character(Cluster)]
+      ),
+      
+      Season == "Winter" ~ unname(
+        winter_labels[as.character(Cluster)]
+      )
+    )
+  )
+
+
+level2_results %>%
+  count(Season, Irradiance_Level)
+level2_results %>%
+  group_by(Season, Irradiance_Level) %>%
+  summarise(
+    Min_Beta = min(beta),
+    Mean_Beta = mean(beta),
+    Max_Beta = max(beta),
+    SD_Beta = sd(beta),
+    Days = n(),
+    .groups = "drop"
+  )
+
+```
+
+```{r analysis-047}
+## Level 2 clustering quality metrics
+
+summer_metrics <- intCriteria(
+  matrix(level2_data$beta[level2_data$Season == "Summer"]),
+  summer_kmeans$cluster,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+transition_metrics <- intCriteria(
+  matrix(level2_data$beta[level2_data$Season == "Transition"]),
+  transition_kmeans$cluster,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+winter_metrics <- intCriteria(
+  matrix(level2_data$beta[level2_data$Season == "Winter"]),
+  winter_kmeans$cluster,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+level2_metrics <- data.frame(
+  Season = c("Summer", "Transition", "Winter"),
+  
+  Silhouette = c(
+    summer_metrics$silhouette,
+    transition_metrics$silhouette,
+    winter_metrics$silhouette
+  ),
+  
+  Calinski_Harabasz = c(
+    summer_metrics$calinski_harabasz,
+    transition_metrics$calinski_harabasz,
+    winter_metrics$calinski_harabasz
+  ),
+  
+  Davies_Bouldin = c(
+    summer_metrics$davies_bouldin,
+    transition_metrics$davies_bouldin,
+    winter_metrics$davies_bouldin
+  )
+)
+
+level2_metrics
+```
+
+```{r analysis-048}
+## Mean irradiance profiles for Level 2 clusters
+
+level2_profiles <- level2_results %>%
+  select(Date, Season, Irradiance_Level) %>%
+  inner_join(
+    daily_profiles,
+    by = "Date"
+  )
+
+
+#Converting to long format
+
+level2_profiles_long <- level2_profiles %>%
+  pivot_longer(
+    cols = starts_with("GHI_"),
+    names_to = "Hour",
+    values_to = "GHI"
+  ) %>%
+  mutate(
+    Hour = as.integer(sub("GHI_", "", Hour))
+  )
+
+
+# Calculating mean profile for every cluster
+
+level2_mean_profiles <- level2_profiles_long %>%
+  group_by(Season, Irradiance_Level, Hour) %>%
+  summarise(
+    Mean_GHI = mean(GHI, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r analysis-049}
+## Mean GHI profiles by season and irradiance level
+
+level2_mean_profiles <- level2_mean_profiles %>%
+  mutate(
+    Season = factor(
+      Season,
+      levels = c("Summer", "Transition", "Winter")
+    ),
+    Irradiance_Level = factor(
+      Irradiance_Level,
+      levels = c("High", "Medium", "Low")
+    )
+  )
+
+ggplot(
+  level2_mean_profiles,
+  aes(
+    x = Hour,
+    y = Mean_GHI,
+    colour = Irradiance_Level
+  )
+) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Season) +
+  scale_x_continuous(
+    breaks = seq(4, 19, by = 2)
+  ) +
+  labs(
+    title = "Mean Daily GHI Profiles by Season and Irradiance Level",
+    x = "Hour",
+    y = "Mean GHI (W/m²)",
+    colour = "Irradiance Level"
+  ) +
+  theme_minimal()
+```
+
+
+## ED profile clustering
+
+```{r analysis-050}
+## Level 2 -- Euclidean Distance (ED) clustering
+
+ed_data <- level1_results_scaled %>%
+  select(Date, Season) %>%
+  inner_join(
+    daily_profiles,
+    by = "Date"
+  )
+
+
+#Seperating the 3 seasons
+
+summer_ed <- ed_data %>%
+  filter(Season == "Summer") %>%
+  select(starts_with("GHI_")) %>%
+  as.matrix()
+
+transition_ed <- ed_data %>%
+  filter(Season == "Transition") %>%
+  select(starts_with("GHI_")) %>%
+  as.matrix()
+
+winter_ed <- ed_data %>%
+  filter(Season == "Winter") %>%
+  select(starts_with("GHI_")) %>%
+  as.matrix()
+
+```
+
+```{r analysis-051}
+summer_dist <- dist(summer_ed, method = "euclidean")
+transition_dist <- dist(transition_ed, method = "euclidean")
+winter_dist <- dist(winter_ed, method = "euclidean")
+
+summary(summer_dist)
+summary(transition_dist)
+summary(winter_dist)
+```
+
+```{r analysis-052}
+## K-Medoids clustering using Euclidean Distance
+
+library(cluster)
+
+set.seed(2026)
+
+summer_pam <- pam(
+  summer_dist,
+  k = 3,
+  diss = TRUE
+)
+transition_pam <- pam(
+  transition_dist,
+  k = 3,
+  diss = TRUE
+)
+winter_pam <- pam(
+  winter_dist,
+  k = 3,
+  diss = TRUE
+)
+
+#inspection
+summer_pam
+transition_pam
+winter_pam
+
+print("medoids")
+summer_pam$medoids
+transition_pam$medoids
+winter_pam$medoids
+
+table(summer_pam$clustering)
+table(transition_pam$clustering)
+table(winter_pam$clustering)
+```
+
+```{r analysis-054}
+## Add ED cluster assignments
+
+summer_ed_results <- ed_data %>%
+  filter(Season == "Summer") %>%
+  mutate(
+    Cluster = summer_pam$clustering
+  )
+
+transition_ed_results <- ed_data %>%
+  filter(Season == "Transition") %>%
+  mutate(
+    Cluster = transition_pam$clustering
+  )
+
+winter_ed_results <- ed_data %>%
+  filter(Season == "Winter") %>%
+  mutate(
+    Cluster = winter_pam$clustering
+  )
+
+ed_results <- bind_rows(
+  summer_ed_results,
+  transition_ed_results,
+  winter_ed_results
+)
+
+ed_results %>%
+  count(Season, Cluster)
+
+## Assign meaningful irradiance levels to ED clusters
+
+## Automatically identify High / Medium / Low ED clusters
+
+ed_cluster_labels <- ed_results %>%
+  mutate(
+    Daily_Mean_GHI = rowMeans(
+      pick(starts_with("GHI_")),
+      na.rm = TRUE
+    )
+  ) %>%
+  group_by(Season, Cluster) %>%
+  summarise(
+    Overall_Mean_GHI = mean(Daily_Mean_GHI, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(Season) %>%
+  arrange(
+    Overall_Mean_GHI,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    Irradiance_Level = c(
+      "Low",
+      "Medium",
+      "High"
+    )
+  ) %>%
+  ungroup()
+
+ed_cluster_labels
+
+#attaching labels
+
+ed_results <- ed_results %>%
+  left_join(
+    ed_cluster_labels %>%
+      select(
+        Season,
+        Cluster,
+        Irradiance_Level
+      ),
+    by = c(
+      "Season",
+      "Cluster"
+    )
+  )
+
+ed_results %>%
+  count(Season, Cluster, Irradiance_Level
+  )
+
+ed_results %>%
+  mutate(
+    Daily_Mean_GHI = rowMeans(pick(starts_with("GHI_")), na.rm = TRUE)
+  ) %>%
+  group_by(Season, Irradiance_Level) %>%
+  summarise(
+    Mean_GHI = mean(Daily_Mean_GHI),
+    Days = n(),
+    .groups = "drop"
+  )
+```
+
+```{r analysis-055}
+## Convert ED daily profiles to long format
+
+ed_profiles_long <- ed_results %>%
+  pivot_longer(
+    cols = starts_with("GHI_"),
+    names_to = "Hour",
+    values_to = "GHI"
+  ) %>%
+  mutate(
+    Hour = as.integer(sub("GHI_", "", Hour))
+  )
+
+## Mean GHI profile for each ED cluster
+
+ed_mean_profiles <- ed_profiles_long %>%
+  group_by(Season, Cluster, Irradiance_Level, Hour) %>%
+  summarise(
+    Mean_GHI = mean(GHI, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+## Mean daily GHI profiles from ED clustering
+
+ed_mean_profiles_plot <- ed_mean_profiles %>%
+  mutate(
+    Season = factor(
+      Season,
+      levels = c("Summer", "Transition", "Winter")
+    ),
+    Irradiance_Level = factor(
+      Irradiance_Level,
+      levels = c("High", "Medium", "Low")
+    )
+  )
+
+ggplot(
+  ed_mean_profiles_plot,
+  aes(
+    x = Hour,
+    y = Mean_GHI,
+    colour = Irradiance_Level
+  )
+) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Season) +
+  scale_x_continuous(
+    breaks = seq(4, 19, by = 2)
+  ) +
+  labs(
+    title = "Mean Daily GHI Profiles from ED Clustering",
+    x = "Hour",
+    y = "Mean GHI (W/m²)",
+    colour = "Irradiance Level"
+  ) +
+  theme_minimal()
+
+ggplot( ed_mean_profiles, aes( x = Hour, y = Mean_GHI, colour = factor(Cluster) ) ) + 
+  geom_line(linewidth = 1) + 
+  facet_wrap(~Season) +
+  scale_x_continuous( breaks = seq(4, 19, by = 2) ) + 
+  labs( title = "Mean Daily GHI Profiles from ED Clustering", x = "Hour", y = "Mean GHI (W/m²)", colour = "ED Cluster" ) + 
+  theme_minimal()
+```
+
+```{r analysis-057}
+## ED clustering quality metrics
+
+summer_ed_metrics <- intCriteria(
+  summer_ed,
+  summer_pam$clustering,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+transition_ed_metrics <- intCriteria(
+  transition_ed,
+  transition_pam$clustering,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+winter_ed_metrics <- intCriteria(
+  winter_ed,
+  winter_pam$clustering,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+ed_metrics <- data.frame(
+  Season = c("Summer", "Transition", "Winter"),
+  
+  Silhouette = c(
+    summer_ed_metrics$silhouette,
+    transition_ed_metrics$silhouette,
+    winter_ed_metrics$silhouette
+  ),
+  
+  Calinski_Harabasz = c(
+    summer_ed_metrics$calinski_harabasz,
+    transition_ed_metrics$calinski_harabasz,
+    winter_ed_metrics$calinski_harabasz
+  ),
+  
+  Davies_Bouldin = c(
+    summer_ed_metrics$davies_bouldin,
+    transition_ed_metrics$davies_bouldin,
+    winter_ed_metrics$davies_bouldin
+  )
+)
+
+ed_metrics
+```
+
+
+## DTW profile clustering
+
+```{r analysis-058}
+## Prepare DTW daily profiles
+
+summer_dtw <- ed_data %>%
+  filter(Season == "Summer") %>%
+  select(starts_with("GHI_")) %>%
+  as.matrix()
+
+transition_dtw <- ed_data %>%
+  filter(Season == "Transition") %>%
+  select(starts_with("GHI_")) %>%
+  as.matrix()
+
+winter_dtw <- ed_data %>%
+  filter(Season == "Winter") %>%
+  select(starts_with("GHI_")) %>%
+  as.matrix()
+
+```
+
+```{r analysis-059}
+library(dtwclust)
+
+# Calculate DTW distance matrices
+
+summer_dtw_dist <- proxy::dist(
+  summer_dtw,
+  method = "dtw_basic"
+)
+
+transition_dtw_dist <- proxy::dist(
+  transition_dtw,
+  method = "dtw_basic"
+)
+
+winter_dtw_dist <- proxy::dist(
+  winter_dtw,
+  method = "dtw_basic"
+)
+
+summary(summer_dtw_dist)
+summary(transition_dtw_dist)
+summary(winter_dtw_dist)
+
+class(summer_dtw_dist)
+class(transition_dtw_dist)
+class(winter_dtw_dist)
+```
+
+```{r analysis-060}
+## K-Medoids clustering using DTW distance
+
+set.seed(2026)
+
+summer_dtw_pam <- pam(
+  summer_dtw_dist,
+  k = 3,
+  diss = TRUE
+)
+
+transition_dtw_pam <- pam(
+  transition_dtw_dist,
+  k = 3,
+  diss = TRUE
+)
+
+winter_dtw_pam <- pam(
+  winter_dtw_dist,
+  k = 3,
+  diss = TRUE
+)
+
+table(summer_dtw_pam$clustering)
+table(transition_dtw_pam$clustering)
+table(winter_dtw_pam$clustering)
+
+summer_dtw_pam$medoids
+transition_dtw_pam$medoids
+winter_dtw_pam$medoids
+```
+
+```{r analysis-061}
+summer_dtw_profiles <- ed_data %>%
+  filter(Season == "Summer") %>%
+  select(Date, Season, starts_with("GHI_")) %>%
+  mutate(Cluster = summer_dtw_pam$clustering)
+
+transition_dtw_profiles <- ed_data %>%
+  filter(Season == "Transition") %>%
+  select(Date, Season, starts_with("GHI_")) %>%
+  mutate(Cluster = transition_dtw_pam$clustering)
+
+winter_dtw_profiles <- ed_data %>%
+  filter(Season == "Winter") %>%
+  select(Date, Season, starts_with("GHI_")) %>%
+  mutate(Cluster = winter_dtw_pam$clustering)
+
+#Calc mean profiles
+
+summer_dtw_mean <- summer_dtw_profiles %>%
+  group_by(Cluster) %>%
+  summarise(
+    across(starts_with("GHI_"),\(x) mean(x, na.rm = TRUE))
+  ) %>%
+  mutate(Season = "Summer")
+
+transition_dtw_mean <- transition_dtw_profiles %>%
+  group_by(Cluster) %>%
+  summarise(
+    across(starts_with("GHI_"),\(x) mean(x, na.rm = TRUE))
+  ) %>%
+  mutate(Season = "Transition")
+
+winter_dtw_mean <- winter_dtw_profiles %>%
+  group_by(Cluster) %>%
+  summarise(
+    across(starts_with("GHI_"),\(x) mean(x, na.rm = TRUE))
+  ) %>%
+  mutate(Season = "Winter")
+
+#combining them
+dtw_mean_profiles <- bind_rows(
+  summer_dtw_mean,
+  transition_dtw_mean,
+  winter_dtw_mean
+)
+```
+
+```{r analysis-062}
+dtw_mean_long <- dtw_mean_profiles %>%
+  pivot_longer(
+    cols = starts_with("GHI_"),
+    names_to = "Hour",
+    values_to = "Mean_GHI"
+  ) %>%
+  mutate(
+    Hour = as.numeric(sub("GHI_", "", Hour)),
+  )
+
+
+#Plotting
+
+ggplot(
+  dtw_mean_long,
+  aes(x = Hour, y = Mean_GHI, group = Cluster, colour = Cluster)
+) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Season) +
+  scale_x_continuous(
+    breaks = 4:19
+  ) +
+  labs(
+    x = "Hour",
+    y = "Mean GHI (W/m²)",
+    colour = "DTW Cluster"
+  ) +
+  theme_minimal()
+
+## Creating final DTW profile dataset & plot
+
+## Automatically identify High / Medium / Low DTW clusters
+
+dtw_cluster_labels <- dtw_mean_long %>%
+  group_by(
+    Season,
+    Cluster
+  ) %>%
+  summarise(
+    Overall_Mean_GHI = mean(
+      Mean_GHI,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  group_by(Season) %>%
+  arrange(
+    Overall_Mean_GHI,
+    .by_group = TRUE
+  ) %>%
+  mutate(
+    Irradiance_Level = c(
+      "Low",
+      "Medium",
+      "High"
+    )
+  ) %>%
+  ungroup()
+
+dtw_cluster_labels
+
+dtw_mean_profiles_plot <- dtw_mean_long %>%
+  left_join(
+    dtw_cluster_labels %>%
+      select(Season,Cluster,Irradiance_Level),
+    by = c("Season","Cluster")
+  ) %>%
+  mutate(
+    Season = factor(
+      Season,
+      levels = c("Summer", "Transition", "Winter")
+    ),
+    Irradiance_Level = factor(
+      Irradiance_Level,
+      levels = c("High", "Medium", "Low")
+    )
+  )
+
+#Making improved plot
+ggplot(
+  dtw_mean_profiles_plot,
+  aes(
+    x = Hour,
+    y = Mean_GHI,
+    colour = Irradiance_Level
+  )
+) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Season) +
+  scale_x_continuous(
+    breaks = seq(4, 19, by = 2)
+  ) +
+  labs(
+    title = "Mean Daily GHI Profiles by Season and Irradiance Level",
+    x = "Hour",
+    y = "Mean GHI (W/m²)",
+    colour = "Irradiance Level"
+  ) +
+  theme_minimal()
+```
+
+```{r analysis-063}
+## Euclidean-space quality metrics for the DTW-generated partition
+# intCriteria receives raw profiles; these three scores use Euclidean geometry.
+# Keep them as supplementary profile-space assessments, not native DTW scores.
+
+summer_dtw_metrics <- intCriteria(
+  summer_dtw,
+  summer_dtw_pam$clustering,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+transition_dtw_metrics <- intCriteria(
+  transition_dtw,
+  transition_dtw_pam$clustering,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+winter_dtw_metrics <- intCriteria(
+  winter_dtw,
+  winter_dtw_pam$clustering,
+  c("Silhouette", "Calinski_Harabasz", "Davies_Bouldin")
+)
+
+dtw_metrics <- data.frame(
+  Season = c("Summer", "Transition", "Winter"),
+  
+  Silhouette_Euclidean = c(
+    summer_dtw_metrics$silhouette,
+    transition_dtw_metrics$silhouette,
+    winter_dtw_metrics$silhouette
+  ),
+  
+  Calinski_Harabasz_Euclidean = c(
+    summer_dtw_metrics$calinski_harabasz,
+    transition_dtw_metrics$calinski_harabasz,
+    winter_dtw_metrics$calinski_harabasz
+  ),
+  
+  Davies_Bouldin_Euclidean = c(
+    summer_dtw_metrics$davies_bouldin,
+    transition_dtw_metrics$davies_bouldin,
+    winter_dtw_metrics$davies_bouldin
+  )
+)
+
+# Supply the same dissimilarities used by PAM, in the same observation order.
+dtw_metrics$Silhouette_DTW <- c(
+  mean(cluster::silhouette(
+    summer_dtw_pam$clustering, summer_dtw_dist
+  )[, "sil_width"]),
+  mean(cluster::silhouette(
+    transition_dtw_pam$clustering, transition_dtw_dist
+  )[, "sil_width"]),
+  mean(cluster::silhouette(
+    winter_dtw_pam$clustering, winter_dtw_dist
+  )[, "sil_width"])
+)
+
+dtw_metrics <- dtw_metrics %>%
+  select(Season, Silhouette_DTW, everything())
+
+dtw_metrics
+```
+
+```{r analysis-064}
+dtw_results <- bind_rows(
+  summer_dtw_profiles,
+  transition_dtw_profiles,
+  winter_dtw_profiles
+) %>%
+  left_join(
+    dtw_cluster_labels %>%
+      select(Season, Cluster, Irradiance_Level),
+    by = c("Season", "Cluster")
+  )
+
+dtw_results %>%
+  count(Season, Cluster, Irradiance_Level)
+```
+
+
+## Agreement between classifications
+
+```{r analysis-065}
+## Confusion matrix: Beta vs ED and Beta vs DTW
+
+library(dplyr)
+library(tidyr)
+
+level_order  <- c("High", "Medium", "Low")
+season_order <- c("Winter", "Transition", "Summer")
+
+## Keep only the labels we need
+beta_labels <- level2_results %>%
+  select(Date, Season, Beta_Level = Irradiance_Level)
+
+ed_labels <- ed_results %>%
+  select(Date, Season, ED_Level = Irradiance_Level)
+
+dtw_labels <- dtw_results %>%
+  select(Date, Season, DTW_Level = Irradiance_Level)
+
+## Combine all three methods by Date and Season
+comparison_data <- beta_labels %>%
+  inner_join(ed_labels,  by = c("Date", "Season")) %>%
+  inner_join(dtw_labels, by = c("Date", "Season")) %>%
+  mutate(
+    Season     = factor(Season, levels = season_order),
+    Beta_Level = factor(Beta_Level, levels = level_order),
+    ED_Level   = factor(ED_Level, levels = level_order),
+    DTW_Level  = factor(DTW_Level, levels = level_order)
+  )
+
+```
+
+```{r analysis-066}
+## Beta vs ED
+
+beta_ed_confusion <- comparison_data %>%
+  count(Season, Beta_Level, ED_Level, name = "n") %>%
+  complete(
+    Season,
+    Beta_Level,
+    ED_Level,
+    fill = list(n = 0)
+  ) %>%
+  group_by(Season, Beta_Level) %>%
+  mutate(Proportion = n / sum(n)) %>%
+  ungroup() %>%
+  select(Season, Beta_Level, ED_Level, Proportion) %>%
+  pivot_wider(
+    names_from = ED_Level,
+    values_from = Proportion,
+    names_prefix = "ED_"
+  ) %>%
+  arrange(Season, Beta_Level)
+
+beta_ed_confusion
+
+## Beta vs DTW
+
+beta_dtw_confusion <- comparison_data %>%
+  count(Season, Beta_Level, DTW_Level, name = "n") %>%
+  complete(
+    Season,
+    Beta_Level,
+    DTW_Level,
+    fill = list(n = 0)
+  ) %>%
+  group_by(Season, Beta_Level) %>%
+  mutate(Proportion = n / sum(n)) %>%
+  ungroup() %>%
+  select(Season, Beta_Level, DTW_Level, Proportion) %>%
+  pivot_wider(
+    names_from = DTW_Level,
+    values_from = Proportion,
+    names_prefix = "DTW_"
+  ) %>%
+  arrange(Season, Beta_Level)
+
+beta_dtw_confusion
+```
+
+```{r analysis-067}
+confusion_table <- beta_ed_confusion %>%
+  inner_join(
+    beta_dtw_confusion,
+    by = c("Season", "Beta_Level")
+  ) %>%
+  rename(
+    `Irradiance Level` = Beta_Level,
+    `ED High` = ED_High,
+    `ED Medium` = ED_Medium,
+    `ED Low` = ED_Low,
+    `DTW High` = DTW_High,
+    `DTW Medium` = DTW_Medium,
+    `DTW Low` = DTW_Low
+  ) %>%
+  mutate(
+    across(
+      c(`ED High`, `ED Medium`, `ED Low`,
+        `DTW High`, `DTW Medium`, `DTW Low`),
+      ~ round(.x, 2)
+    )
+  )
+
+confusion_table
+```
+
+
+## Bootstrap stability
+
+```{r bootstrap-package}
+library(mclust)
+```
+
+```{r analysis-074}
+## Function for bootstrap stability of beta clustering
+
+bootstrap_beta_stability <- function(season_data, B = 100) {
+  
+  season_data <- season_data %>%
+    select(
+      Date,
+      beta,
+      Original_Cluster = Cluster
+    ) %>%
+    arrange(Date) %>%
+    mutate(
+      Original_Index = row_number()
+    )
+  
+  n <- nrow(season_data)
+  
+  ari_values <- numeric(B)
+  
+  for (b in 1:B) {
+    
+    # Bootstrap sample
+    bootstrap_indices <- sample(
+      seq_len(n),
+      size = n,
+      replace = TRUE
+    )
+    
+    bootstrap_data <- season_data[
+      bootstrap_indices,
+    ]
+    
+    # Re-run beta clustering
+    bootstrap_kmeans <- kmeans(
+      bootstrap_data %>%
+        select(beta),
+      centers = 3,
+      nstart = 25
+    )
+    
+    ## Match bootstrap assignments back to original observations
+    bootstrap_assignments <- data.frame(
+      Original_Index = bootstrap_indices,
+      Bootstrap_Cluster = bootstrap_kmeans$cluster
+    )
+
+    # Check that repeated copies of a day have the same assignment.
+    assignment_check <- bootstrap_assignments %>%
+      dplyr::group_by(Original_Index) %>%
+      dplyr::summarise(
+        Number_of_Assignments = dplyr::n_distinct(Bootstrap_Cluster),
+        .groups = "drop"
+      )
+
+    if (any(assignment_check$Number_of_Assignments != 1L)) {
+      stop(
+        paste0(
+          "Bootstrap replicate ", b,
+          ": repeated copies of a day received different cluster assignments."
+        )
+      )
+    }
+
+    # Count each sampled original day only once when calculating ARI.
+    bootstrap_assignments <- bootstrap_assignments %>%
+      dplyr::distinct(Original_Index, .keep_all = TRUE)
+    
+    # Compare with original clustering
+    bootstrap_comparison <- bootstrap_assignments %>%
+      left_join(
+        season_data %>%
+          select(
+            Original_Index,
+            Original_Cluster
+          ),
+        by = "Original_Index"
+      )
+    
+    # Adjusted Rand Index
+    ari_values[b] <- adjustedRandIndex(
+      bootstrap_comparison$Original_Cluster,
+      bootstrap_comparison$Bootstrap_Cluster
+    )
+  }
+  
+  return(ari_values)
+}
+```
+
+```{r analysis-077}
+## Prepare Level 1 data for bootstrap stability analysis
+
+level1_stability <- level1_results_scaled %>%
+  select(Date, Sunshine_Duration, CS_Area,
+    Original_Cluster = Cluster
+  ) %>%
+  arrange(Date)
+
+table(level1_stability$Original_Cluster)
+
+```
+
+```{r analysis-080}
+## Function for bootstrap stability of Level 1 clustering
+
+bootstrap_level1_stability <- function(level1_data, B = 100) {
+  
+  level1_data <- level1_data %>%
+    select(Date, Sunshine_Duration, CS_Area, Original_Cluster) %>%
+    arrange(Date) %>%
+    mutate(
+      Original_Index = row_number()
+    )
+  
+  n <- nrow(level1_data)
+  
+  ari_values <- numeric(B)
+  
+  for (b in 1:B) {
+    
+    # Draw bootstrap sample
+    bootstrap_indices <- sample(seq_len(n), size = n, replace = TRUE)
+    
+    bootstrap_data <- level1_data[
+      bootstrap_indices,
+    ]
+    
+    # Scale Level 1 features
+    bootstrap_scaled <- scale(
+      bootstrap_data %>%
+        select(
+          Sunshine_Duration,
+          CS_Area
+        )
+    )
+    
+    # Re-run K-Means
+    bootstrap_kmeans <- kmeans(
+      bootstrap_scaled,
+      centers = 3,
+      nstart = 25
+    )
+    
+    ## Match bootstrap assignments back to original observations
+    bootstrap_assignments <- data.frame(
+      Original_Index = bootstrap_indices,
+      Bootstrap_Cluster = bootstrap_kmeans$cluster
+    )
+
+    # Check that repeated copies of a day have the same assignment.
+    assignment_check <- bootstrap_assignments %>%
+      dplyr::group_by(Original_Index) %>%
+      dplyr::summarise(
+        Number_of_Assignments = dplyr::n_distinct(Bootstrap_Cluster),
+        .groups = "drop"
+      )
+
+    if (any(assignment_check$Number_of_Assignments != 1L)) {
+      stop(
+        paste0(
+          "Bootstrap replicate ", b,
+          ": repeated copies of a day received different cluster assignments."
+        )
+      )
+    }
+
+    # Count each sampled original day only once when calculating ARI.
+    bootstrap_assignments <- bootstrap_assignments %>%
+      dplyr::distinct(Original_Index, .keep_all = TRUE)
+    
+    # Join original cluster assignments
+    bootstrap_comparison <- bootstrap_assignments %>%
+      left_join(
+        level1_data %>%
+          select(
+            Original_Index,
+            Original_Cluster
+          ),
+        by = "Original_Index"
+      )
+    
+    # Calculate ARI
+    ari_values[b] <- adjustedRandIndex(
+      bootstrap_comparison$Original_Cluster,
+      bootstrap_comparison$Bootstrap_Cluster
+    )
+  }
+  
+  return(ari_values)
+}
+```
+
+```{r analysis-083}
+## Full two-level bootstrap stability analysis
+
+two_level_stability <- level1_stability %>%
+  select(
+    Date,
+    Sunshine_Duration,
+    CS_Area,
+    Original_L1_Cluster = Original_Cluster
+  ) %>%
+  inner_join(
+    level2_results %>%
+      select(
+        Date,
+        beta,
+        Original_L2_Cluster = Cluster
+      ),
+    by = "Date"
+  ) %>%
+  arrange(Date)
+
+two_level_stability <- two_level_stability %>%
+  mutate(
+    Original_TwoLevel_Cluster = interaction(
+      Original_L1_Cluster,
+      Original_L2_Cluster,
+      drop = TRUE
+    )
+  )
+
+table(two_level_stability$Original_L1_Cluster)
+table(two_level_stability$Original_TwoLevel_Cluster)
+```
+
+```{r analysis-087}
+## Function for bootstrap stability of the full two-level methodology
+
+bootstrap_two_level_stability <- function(two_level_data, B = 100) {
+  
+  two_level_data <- two_level_data %>%
+    arrange(Date) %>%
+    mutate(
+      Original_Index = row_number()
+    )
+  
+  n <- nrow(two_level_data)
+  
+  ari_values <- numeric(B)
+  
+  for (b in 1:B) {
+    
+    # -----------------------------
+    # Draw bootstrap sample
+    
+    bootstrap_indices <- sample(
+      seq_len(n),
+      size = n,
+      replace = TRUE
+    )
+    
+    bootstrap_data <- two_level_data[
+      bootstrap_indices,
+    ]
+    
+    # -----------------------------
+    # Re-run Level 1
+    
+    bootstrap_scaled <- scale(
+      bootstrap_data %>%
+        select(
+          Sunshine_Duration,
+          CS_Area
+        )
+    )
+    
+    bootstrap_L1_kmeans <- kmeans(
+      bootstrap_scaled,
+      centers = 3,
+      nstart = 25
+    )
+    
+    bootstrap_data$Bootstrap_L1_Cluster <-
+      bootstrap_L1_kmeans$cluster
+    
+    # -----------------------------
+    # Re-run Level 2 within each new Level 1 cluster
+
+    bootstrap_data$Bootstrap_L2_Cluster <- NA_integer_
+    
+    for (
+      g in sort(
+        unique(bootstrap_data$Bootstrap_L1_Cluster)
+      )
+    ) {
+      
+      group_indices <- which(
+        bootstrap_data$Bootstrap_L1_Cluster == g
+      )
+      
+      beta_group <- matrix(
+        bootstrap_data$beta[group_indices],
+        ncol = 1
+      )
+      
+      bootstrap_L2_kmeans <- kmeans(
+        beta_group,
+        centers = 3,
+        nstart = 25
+      )
+      
+      bootstrap_data$Bootstrap_L2_Cluster[group_indices] <-
+        bootstrap_L2_kmeans$cluster
+    }
+    
+    # -----------------------------
+    # Create final 9-group bootstrap partition
+    
+    bootstrap_data$Bootstrap_TwoLevel_Cluster <- interaction(
+      bootstrap_data$Bootstrap_L1_Cluster,
+      bootstrap_data$Bootstrap_L2_Cluster,
+      drop = TRUE
+    )
+    
+    # -----------------------------
+    # Match back to original days
+    
+    bootstrap_assignments <- data.frame(
+      Original_Index = bootstrap_indices,
+      Bootstrap_TwoLevel_Cluster =
+        bootstrap_data$Bootstrap_TwoLevel_Cluster
+    )
+    
+    # Check repeated copies of a day received only one classification
+    
+    assignment_check <- bootstrap_assignments %>%
+      group_by(Original_Index) %>%
+      summarise(
+        Number_of_Assignments =
+          n_distinct(Bootstrap_TwoLevel_Cluster),
+        .groups = "drop"
+      )
+    
+    if (any(assignment_check$Number_of_Assignments != 1)) {
+      stop("A duplicated observation received multiple bootstrap assignments.")
+    }
+    
+    # Keep every original day only once
+    bootstrap_assignments <- bootstrap_assignments %>%
+      distinct(
+        Original_Index,
+        Bootstrap_TwoLevel_Cluster
+      )
+    
+    # -----------------------------
+    # Join original partition
+    
+    bootstrap_comparison <- bootstrap_assignments %>%
+      left_join(
+        two_level_data %>%
+          select(
+            Original_Index,
+            Original_TwoLevel_Cluster
+          ),
+        by = "Original_Index"
+      )
+    
+    # -----------------------------
+    # Calculate ARI
+    
+    ari_values[b] <- adjustedRandIndex(
+      bootstrap_comparison$Original_TwoLevel_Cluster,
+      bootstrap_comparison$Bootstrap_TwoLevel_Cluster
+    )
+  }
+  
+  return(ari_values)
+}
+```
+
+```{r analysis-089}
+## Final bootstrap stability analysis
+
+set.seed(2026)
+
+B_final <- 1000
+
+# Level 1 seasonal clustering
+level1_ari_final <- bootstrap_level1_stability(
+  level1_stability,
+  B = B_final
+)
+
+# Level 2 beta clustering - Summer
+summer_ari_final <- bootstrap_beta_stability(
+  level2_results %>%
+    filter(Season == "Summer"),
+  B = B_final
+)
+
+# Level 2 beta clustering - Transition
+transition_ari_final <- bootstrap_beta_stability(
+  level2_results %>%
+    filter(Season == "Transition"),
+  B = B_final
+)
+
+# Level 2 beta clustering - Winter
+winter_ari_final <- bootstrap_beta_stability(
+  level2_results %>%
+    filter(Season == "Winter"),
+  B = B_final
+)
+
+# Complete two-level methodology
+two_level_ari_final <- bootstrap_two_level_stability(
+  two_level_stability,
+  B = B_final
+)
+
+##-------
+## quick check
+
+summary(level1_ari_final)
+summary(summer_ari_final)
+summary(transition_ari_final)
+summary(winter_ari_final)
+summary(two_level_ari_final)
+
+sd(level1_ari_final)
+sd(summer_ari_final)
+sd(transition_ari_final)
+sd(winter_ari_final)
+sd(two_level_ari_final)
+```
+
+```{r analysis-090}
+## Final bootstrap summary table
+
+bootstrap_final_summary <- data.frame(
+  Analysis = c(
+    "Level 1",
+    "Summer - Level 2",
+    "Transition - Level 2",
+    "Winter - Level 2",
+    "Full two-level methodology"
+  ),
+  
+  Mean_ARI = c(
+    mean(level1_ari_final),
+    mean(summer_ari_final),
+    mean(transition_ari_final),
+    mean(winter_ari_final),
+    mean(two_level_ari_final)
+  ),
+  
+  Median_ARI = c(
+    median(level1_ari_final),
+    median(summer_ari_final),
+    median(transition_ari_final),
+    median(winter_ari_final),
+    median(two_level_ari_final)
+  ),
+  
+  SD_ARI = c(
+    sd(level1_ari_final),
+    sd(summer_ari_final),
+    sd(transition_ari_final),
+    sd(winter_ari_final),
+    sd(two_level_ari_final)
+  ),
+  
+  Min_ARI = c(
+    min(level1_ari_final),
+    min(summer_ari_final),
+    min(transition_ari_final),
+    min(winter_ari_final),
+    min(two_level_ari_final)
+  ),
+  
+  Max_ARI = c(
+    max(level1_ari_final),
+    max(summer_ari_final),
+    max(transition_ari_final),
+    max(winter_ari_final),
+    max(two_level_ari_final)
+  )
+)
+
+bootstrap_final_summary
+```
+
+
+## Final tables and figures
+
+```{r analysis-092, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+results_location <- "L1"   # Change to L2, L3, L4 or L5 as appropriate
+results_seasons <- c("Summer", "Transition", "Winter")
+results_levels <- c("High", "Medium", "Low")
+results_colours <- c(High = "#F8766D", Medium = "#00BA38", Low = "#619CFF")
+results_season_colours <- c(Summer = "#F8766D", Transition = "#00BA38",
+                           Winter = "#619CFF")
+
+# Consistent appearance at the exported size.
+results_theme <- theme_minimal(base_size = 10) +
+  theme(plot.title = element_blank(), plot.subtitle = element_blank(),
+        strip.text = element_text(face = "bold"),
+        panel.grid.minor = element_blank())
+
+# Format a COPY for display/export. Original result objects keep their names.
+results_display_table <- function(x) {
+  out <- as.data.frame(x)
+  if ("Method" %in% names(out)) {
+    out$Method <- as.character(out$Method)
+    out$Method[out$Method == "Beta"] <- "β"
+  }
+  if ("Representation" %in% names(out)) {
+    out$Representation <- gsub("beta", "β", out$Representation, fixed = TRUE)
+  }
+  labels <- gsub("_", " ", names(out), fixed = TRUE)
+  labels <- gsub("Beta", "β", labels, fixed = TRUE)
+  names(out) <- labels
+  replacements <- c(
+    "Irradiance Level" = "Level",
+    "Percent in Season" = "% within season",
+    "Percent Days" = "% of days",
+    "Mean Duration Minutes" = "Mean duration (min)",
+    "Mean CS Area kWh m2" = "Mean clear-sky total (kWh/m²)",
+    "Calinski Harabasz" = "Calinski–Harabasz",
+    "Davies Bouldin" = "Davies–Bouldin",
+    "Silhouette DTW" = "Silhouette (DTW)",
+    "B" = "Replications"
+  )
+  for (old in names(replacements)) {
+    names(out)[names(out) == old] <- replacements[[old]]
+  }
+  out
+}
+
+# Require the corrected DTW evaluation, rather than silently using old columns.
+stopifnot(all(c(
+  "Silhouette_DTW", "Silhouette_Euclidean",
+  "Calinski_Harabasz_Euclidean", "Davies_Bouldin_Euclidean"
+) %in% names(dtw_metrics)))
+```
+
+```{r analysis-093}
+results_data_table <- data.frame(
+  Location = results_location,
+  First_Input_Date = min(cams$Date),
+  Last_Input_Date = max(cams$Date),
+  Input_Days = dplyr::n_distinct(cams$Date),
+  Retained_Days = dplyr::n_distinct(level2_results$Date),
+  Excluded_Days = dplyr::n_distinct(cams$Date) - dplyr::n_distinct(level2_results$Date),
+  First_Profile_Hour = analysis_start,
+  Last_Profile_Hour = analysis_end
+)
+
+results_data_display <- data.frame(
+  Item = names(results_display_table(results_data_table)),
+  Value = vapply(results_data_table, function(x) as.character(x[[1]]), character(1))
+)
+knitr::kable(results_data_display, row.names = FALSE)
+```
+
+```{r analysis-094, fig.width=9, fig.height=6}
+results_season_data <- level1_results_scaled %>%
+  dplyr::mutate(Season = factor(Season, levels = results_seasons))
+
+results_fig1 <- ggplot(results_season_data,
+                      aes(x = Day_of_Year, y = Year, fill = Season)) +
+  geom_tile() +
+  scale_fill_manual(values = results_season_colours) +
+  labs(x = "Day of year", y = "Year", fill = "Solar season") +
+  results_theme
+
+results_fig1
+```
+
+```{r analysis-095, fig.width=9, fig.height=6}
+# Inspect the centres to confirm their seasonal interpretation.
+level1_kmeans$centers
+
+unscaled_order <- order(level1_kmeans$centers[, "CS_Area"])
+
+unscaled_labels <- setNames(
+  c("Winter", "Transition", "Summer"),
+  rownames(level1_kmeans$centers)[unscaled_order]
+)
+
+results_unscaled_season_data <- level1_results %>%
+  dplyr::mutate(
+    Season = factor(
+      unname(unscaled_labels[as.character(Cluster)]),
+      levels = results_seasons
+    ),
+    Year = format(Date, "%Y"),
+    Day_of_Year = as.integer(format(Date, "%j"))
+  )
+
+results_fig1_unscaled <- ggplot(
+  results_unscaled_season_data,
+  aes(x = Day_of_Year, y = Year, fill = Season)
+) +
+  geom_tile() +
+  scale_fill_manual(values = results_season_colours) +
+  labs(
+    x = "Day of year",
+    y = "Year",
+    fill = "Solar season"
+  ) +
+  results_theme
+
+results_fig1_unscaled
+```
+
+```{r analysis-096}
+results_season_table <- results_season_data %>%
+  dplyr::group_by(Season) %>%
+  dplyr::summarise(
+    Days = dplyr::n(),
+    Mean_Duration_Minutes = mean(Sunshine_Duration),
+    Mean_CS_Area_kWh_m2 = mean(CS_Area),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(Percent_Days = 100 * Days / sum(Days)) %>%
+  dplyr::select(Season, Days, Percent_Days, Mean_Duration_Minutes, Mean_CS_Area_kWh_m2)
+
+results_level1_metrics <- data.frame(
+  Silhouette = level1_metrics_scaled$silhouette,
+  Calinski_Harabasz = level1_metrics_scaled$calinski_harabasz,
+  Davies_Bouldin = level1_metrics_scaled$davies_bouldin
+)
+
+knitr::kable(results_display_table(results_season_table), digits = 3, row.names = FALSE)
+knitr::kable(results_display_table(results_level1_metrics), digits = 4, row.names = FALSE)
+```
+
+```{r analysis-097, fig.width=9, fig.height=4}
+results_beta_data <- level2_results %>%
+  dplyr::mutate(Season = factor(Season, levels = results_seasons),
+         Irradiance_Level = factor(Irradiance_Level, levels = results_levels))
+
+results_fig2 <- ggplot(results_beta_data, aes(x = beta, fill = Season)) +
+  geom_histogram(binwidth = 0.025, boundary = 0,
+                 colour = "white", linewidth = 0.15) +
+  scale_fill_manual(values = results_season_colours, guide = "none") +
+  facet_wrap(~Season, scales = "free_y") +
+  labs(x = expression("Daily Irradiance Index (" * beta * ")"), y = "Number of days") +
+  results_theme
+
+results_fig2
+```
+
+```{r analysis-098}
+results_beta_table <- results_beta_data %>%
+  dplyr::group_by(Season, Irradiance_Level) %>%
+  dplyr::summarise(
+    Days = dplyr::n(), Min_Beta = min(beta), Mean_Beta = mean(beta),
+    Max_Beta = max(beta), SD_Beta = sd(beta), .groups = "drop"
+  ) %>%
+  dplyr::group_by(Season) %>%
+  dplyr::mutate(Percent_in_Season = 100 * Days / sum(Days)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(Season, Irradiance_Level, Days, Percent_in_Season,
+         Min_Beta, Mean_Beta, Max_Beta, SD_Beta)
+
+knitr::kable(results_display_table(results_beta_table), digits = 4, row.names = FALSE)
+```
+
+```{r analysis-099, fig.width=10, fig.height=8}
+results_profile_data <- dplyr::bind_rows(
+  level2_mean_profiles %>%
+    dplyr::select(Season, Irradiance_Level, Hour, Mean_GHI) %>% dplyr::mutate(Method = "Beta"),
+  ed_mean_profiles_plot %>%
+    dplyr::select(Season, Irradiance_Level, Hour, Mean_GHI) %>% dplyr::mutate(Method = "ED"),
+  dtw_mean_profiles_plot %>%
+    dplyr::select(Season, Irradiance_Level, Hour, Mean_GHI) %>% dplyr::mutate(Method = "DTW")
+) %>%
+  dplyr::mutate(Method = factor(Method, levels = c("Beta", "ED", "DTW")),
+         Season = factor(Season, levels = results_seasons),
+         Irradiance_Level = factor(Irradiance_Level, levels = results_levels))
+
+results_fig3 <- ggplot(results_profile_data,
+                      aes(Hour, Mean_GHI, colour = Irradiance_Level)) +
+  geom_line(linewidth = 0.8) +
+  facet_grid(Method ~ Season,
+             labeller = labeller(Method = c(Beta = "β", ED = "ED", DTW = "DTW"))) +
+  scale_colour_manual(values = results_colours) +
+  scale_x_continuous(breaks = seq(analysis_start, analysis_end, by = 2)) +
+  labs(x = "Interval start hour (True Solar Time)",
+       y = expression("Mean hourly GHI (Wh/"*m^2*")"),
+       colour = "Irradiation level") +
+  results_theme +
+  theme(legend.position = "bottom")
+
+results_fig3
+```
+
+```{r analysis-100}
+results_labels <- dplyr::bind_rows(
+  level2_results %>% dplyr::select(Date, Season, Irradiance_Level) %>% dplyr::mutate(Method = "Beta"),
+  ed_results %>% dplyr::select(Date, Season, Irradiance_Level) %>% dplyr::mutate(Method = "ED"),
+  dtw_results %>% dplyr::select(Date, Season, Irradiance_Level) %>% dplyr::mutate(Method = "DTW")
+) %>%
+  dplyr::mutate(Method = factor(Method, levels = c("Beta", "ED", "DTW")),
+         Season = factor(Season, levels = results_seasons),
+         Irradiance_Level = factor(Irradiance_Level, levels = results_levels))
+
+results_counts_table <- results_labels %>%
+  dplyr::count(Method, Season, Irradiance_Level, name = "Days", .drop = FALSE) %>%
+  tidyr::pivot_wider(names_from = Irradiance_Level, values_from = Days, values_fill = 0) %>%
+  dplyr::mutate(Total = High + Medium + Low) %>%
+  dplyr::arrange(Method, Season) %>%
+  dplyr::select(Method, Season, High, Medium, Low, Total)
+
+knitr::kable(results_display_table(results_counts_table), row.names = FALSE)
+```
+
+```{r analysis-101}
+results_metrics_table <- dplyr::bind_rows(
+  level2_metrics %>% dplyr::mutate(Method = "Beta", Representation = "Daily beta"),
+  ed_metrics %>% dplyr::mutate(Method = "ED", Representation = "Hourly profiles"),
+  dtw_metrics %>%
+    dplyr::select(Season, Silhouette = Silhouette_Euclidean,
+           Calinski_Harabasz = Calinski_Harabasz_Euclidean,
+           Davies_Bouldin = Davies_Bouldin_Euclidean) %>%
+    dplyr::mutate(Method = "DTW", Representation = "Hourly profiles")
+) %>%
+  dplyr::mutate(Method = factor(Method, levels = c("Beta", "ED", "DTW")),
+         Season = factor(Season, levels = results_seasons)) %>%
+  dplyr::arrange(Method, Season) %>%
+  dplyr::select(Method, Season, Representation, Silhouette, Calinski_Harabasz, Davies_Bouldin)
+
+results_dtw_silhouette <- dtw_metrics %>%
+  dplyr::mutate(Season = factor(Season, levels = results_seasons)) %>%
+  dplyr::arrange(Season) %>%
+  dplyr::select(Season, Silhouette_DTW)
+
+knitr::kable(results_display_table(results_metrics_table), digits = 4, row.names = FALSE)
+knitr::kable(results_display_table(results_dtw_silhouette), digits = 4, row.names = FALSE)
+```
+
+```{r analysis-102}
+results_agreement_table <- confusion_table %>%
+  dplyr::mutate(Season = factor(Season, levels = results_seasons),
+         `Irradiance Level` = factor(`Irradiance Level`, levels = results_levels)) %>%
+  dplyr::arrange(Season, `Irradiance Level`)
+
+# Identify the reference classification in the displayed header.
+results_agreement_display <- results_display_table(results_agreement_table)
+names(results_agreement_display)[names(results_agreement_display) == "Level"] <- "β level"
+knitr::kable(results_agreement_display, digits = 2, row.names = FALSE)
+```
+
+```{r analysis-103}
+results_bootstrap_data <- dplyr::bind_rows(
+  data.frame(Analysis = "Level 1", ARI = level1_ari_final),
+  data.frame(Analysis = "Summer - Level 2", ARI = summer_ari_final),
+  data.frame(Analysis = "Transition - Level 2", ARI = transition_ari_final),
+  data.frame(Analysis = "Winter - Level 2", ARI = winter_ari_final),
+  data.frame(Analysis = "Full two-level methodology", ARI = two_level_ari_final)
+) %>%
+  dplyr::mutate(Analysis = factor(Analysis, levels = c("Level 1", "Summer - Level 2",
+    "Transition - Level 2", "Winter - Level 2", "Full two-level methodology")))
+
+stopifnot(all(is.finite(results_bootstrap_data$ARI)))
+
+results_bootstrap_table <- results_bootstrap_data %>%
+  dplyr::group_by(Analysis) %>%
+  dplyr::summarise(B = dplyr::n(), Mean_ARI = mean(ARI), Median_ARI = median(ARI),
+            SD_ARI = sd(ARI), Min_ARI = min(ARI), Max_ARI = max(ARI),
+            .groups = "drop")
+
+knitr::kable(results_display_table(results_bootstrap_table), digits = 4, row.names = FALSE)
+```
+
+```{r analysis-104, fig.width=9, fig.height=5}
+results_fig4 <- ggplot(results_bootstrap_data, aes(Analysis, ARI)) +
+  geom_boxplot(width = 0.65) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 3) +
+  labs(x = NULL, y = "Adjusted Rand Index") +
+  results_theme +
+  theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+results_fig4
+```
+
+```{r analysis-105, fig.width=8, fig.height=5}
+results_full_bootstrap <- results_bootstrap_data %>%
+  dplyr::filter(Analysis == "Full two-level methodology")
+
+results_fig5 <- ggplot(results_full_bootstrap, aes(ARI)) +
+  geom_histogram(bins = 20, fill = "grey40", colour = "black") +
+  geom_vline(xintercept = mean(results_full_bootstrap$ARI),
+             linetype = "dashed", linewidth = 0.8) +
+  labs(x = "Adjusted Rand Index", y = "Number of replications") +
+  results_theme
+
+results_fig5
+```
+
